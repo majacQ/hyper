@@ -253,3 +253,6 @@ required-features = ["full"]
 name = "server"
 path = "tests/server.rs"
 required-features = ["full"]
+
+[patch.crates-io]
+httparse = { git = "https://github.com/nox/httparse.git", branch = "line-folding" }
