@@ -1,11 +1,10 @@
-use std::error::Error as StdError;
 use std::fmt;
 #[cfg(feature = "tcp")]
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "http1"))]
 use std::time::Duration;
 
+  <<<<<<< david/fix-error-display
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -19,22 +18,57 @@ use crate::service::{HttpService, MakeServiceRef, Shared, SharedFuture};
 use super::conn::{Http as Http_, NoopWatcher, SpawnAll};
 use super::shutdown::{Graceful, GracefulWatcher};
 #[cfg(feature = "tcp")]
+  =======
+#[cfg(all(feature = "tcp", any(feature = "http1", feature = "http2")))]
+  >>>>>>> master
 use super::tcp::AddrIncoming;
+use crate::common::exec::Exec;
+
+cfg_feature! {
+    #![any(feature = "http1", feature = "http2")]
+
+    use std::error::Error as StdError;
+
+    use pin_project_lite::pin_project;
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    use super::accept::Accept;
+    use crate::body::{Body, HttpBody};
+    use crate::common::{task, Future, Pin, Poll, Unpin};
+    use crate::common::exec::{ConnStreamExec, NewSvcExec};
+    // Renamed `Http` as `Http_` for now so that people upgrading don't see an
+    // error that `hyper::server::Http` is private...
+    use super::conn::{Http as Http_, NoopWatcher, SpawnAll};
+    use super::shutdown::{Graceful, GracefulWatcher};
+    use crate::service::{HttpService, MakeServiceRef};
+}
+
+#[cfg(any(feature = "http1", feature = "http2"))]
+pin_project! {
+    /// A listening HTTP server that accepts connections in both HTTP1 and HTTP2 by default.
+    ///
+    /// `Server` is a `Future` mapping a bound listener with a set of service
+    /// handlers. It is built using the [`Builder`](Builder), and the future
+    /// completes when the server has been shutdown. It should be run by an
+    /// `Executor`.
+    pub struct Server<I, S, E = Exec> {
+        #[pin]
+        spawn_all: SpawnAll<I, S, E>,
+    }
+}
 
 /// A listening HTTP server that accepts connections in both HTTP1 and HTTP2 by default.
 ///
-/// `Server` is a `Future` mapping a bound listener with a set of service
-/// handlers. It is built using the [`Builder`](Builder), and the future
-/// completes when the server has been shutdown. It should be run by an
-/// `Executor`.
-#[pin_project]
+/// Needs at least one of the `http1` and `http2` features to be activated to actually be useful.
+#[cfg(not(any(feature = "http1", feature = "http2")))]
 pub struct Server<I, S, E = Exec> {
-    #[pin]
-    spawn_all: SpawnAll<I, S, E>,
+    _marker: std::marker::PhantomData<(I, S, E)>,
 }
 
 /// A builder for a [`Server`](Server).
 #[derive(Debug)]
+#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 pub struct Builder<I, E = Exec> {
     incoming: I,
     protocol: Http_<E>,
@@ -42,6 +76,8 @@ pub struct Builder<I, E = Exec> {
 
 // ===== impl Server =====
 
+#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 impl<I> Server<I, ()> {
     /// Starts a [`Builder`](Builder) with the provided incoming stream.
     pub fn builder(incoming: I) -> Builder<I> {
@@ -53,7 +89,7 @@ impl<I> Server<I, ()> {
 }
 
 cfg_feature! {
-    #![all(feature = "tcp")]
+    #![all(feature = "tcp", any(feature = "http1", feature = "http2"))]
 
     impl Server<AddrIncoming, ()> {
         /// Binds to the provided address, and returns a [`Builder`](Builder).
@@ -82,7 +118,7 @@ cfg_feature! {
 }
 
 cfg_feature! {
-    #![all(feature = "tcp")]
+    #![all(feature = "tcp", any(feature = "http1", feature = "http2"))]
 
     impl<S, E> Server<AddrIncoming, S, E> {
         /// Returns the local address that this server is bound to.
@@ -92,6 +128,8 @@ cfg_feature! {
     }
 }
 
+#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 impl<I, IO, IE, S, E, B> Server<I, S, E>
 where
     I: Accept<Conn = IO, Error = IE>,
@@ -99,7 +137,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: MakeServiceRef<IO, Body, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    B: HttpBody + Send + Sync + 'static,
+    B: HttpBody + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: ConnStreamExec<<S::Service as HttpService<Body>>::Future, B>,
     E: NewSvcExec<IO, S::Future, S::Service, E, GracefulWatcher>,
@@ -148,6 +186,8 @@ where
     }
 }
 
+#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 impl<I, IO, IE, S, B, E> Future for Server<I, S, E>
 where
     I: Accept<Conn = IO, Error = IE>,
@@ -169,14 +209,17 @@ where
 
 impl<I: fmt::Debug, S: fmt::Debug> fmt::Debug for Server<I, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Server")
-            .field("listener", &self.spawn_all.incoming_ref())
-            .finish()
+        let mut st = f.debug_struct("Server");
+        #[cfg(any(feature = "http1", feature = "http2"))]
+        st.field("listener", &self.spawn_all.incoming_ref());
+        st.finish()
     }
 }
 
 // ===== impl Builder =====
 
+#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 impl<I, E> Builder<I, E> {
     /// Start a new builder, wrapping an incoming stream and low-level options.
     ///
@@ -231,6 +274,24 @@ impl<I, E> Builder<I, E> {
         self
     }
 
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    #[cfg(feature = "http1")]
+    pub fn http1_writev(mut self, enabled: bool) -> Self {
+        self.protocol.http1_writev(enabled);
+        self
+    }
+
     /// Set whether HTTP/1 connections will write header names as title case at
     /// the socket level.
     ///
@@ -244,8 +305,15 @@ impl<I, E> Builder<I, E> {
         self
     }
 
-    /// Set whether HTTP/1 connections will write header names as provided
-    /// at the socket level.
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Request`. It will also look for and use
+    /// such an extension in any provided `Response`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
     ///
     /// Note that this setting does not affect HTTP/2.
     ///
@@ -254,6 +322,17 @@ impl<I, E> Builder<I, E> {
     #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
     pub fn http1_preserve_header_case(mut self, val: bool) -> Self {
         self.protocol.http1_preserve_header_case(val);
+        self
+    }
+
+    /// Set a timeout for reading client request headers. If a client does not 
+    /// transmit the entire header within this time, the connection is closed.
+    ///
+    /// Default is None.
+    #[cfg(all(feature = "http1", feature = "runtime"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "http1", feature = "runtime"))))]
+    pub fn http1_header_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.protocol.http1_header_read_timeout(read_timeout);
         self
     }
 
@@ -352,8 +431,7 @@ impl<I, E> Builder<I, E> {
     /// # Cargo Feature
     ///
     /// Requires the `runtime` cargo feature to be enabled.
-    #[cfg(feature = "runtime")]
-    #[cfg(feature = "http2")]
+    #[cfg(all(feature = "runtime", feature = "http2"))]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
     pub fn http2_keep_alive_interval(mut self, interval: impl Into<Option<Duration>>) -> Self {
         self.protocol.http2_keep_alive_interval(interval);
@@ -370,11 +448,33 @@ impl<I, E> Builder<I, E> {
     /// # Cargo Feature
     ///
     /// Requires the `runtime` cargo feature to be enabled.
-    #[cfg(feature = "runtime")]
-    #[cfg(feature = "http2")]
+    #[cfg(all(feature = "runtime", feature = "http2"))]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
     pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> Self {
         self.protocol.http2_keep_alive_timeout(timeout);
+        self
+    }
+
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently ~400KB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_send_buf_size(mut self, max: usize) -> Self {
+        self.protocol.http2_max_send_buf_size(max);
+        self
+    }
+
+    /// Enables the [extended CONNECT protocol].
+    ///
+    /// [extended CONNECT protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    #[cfg(feature = "http2")]
+    pub fn http2_enable_connect_protocol(mut self) -> Self {
+        self.protocol.http2_enable_connect_protocol();
         self
     }
 
@@ -479,7 +579,7 @@ impl<I, E> Builder<I, E> {
     }
 }
 
-#[cfg(feature = "tcp")]
+#[cfg(all(feature = "tcp", any(feature = "http1", feature = "http2")))]
 impl<E> Builder<AddrIncoming, E> {
     /// Set whether TCP keepalive messages are enabled on accepted connections.
     ///

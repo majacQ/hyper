@@ -13,10 +13,13 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_channel::oneshot;
 use futures_util::future::{self, Either, FutureExt, TryFutureExt};
 #[cfg(feature = "stream")]
 use futures_util::stream::StreamExt as _;
+use h2::client::SendRequest;
+use h2::{RecvStream, SendStream};
 use http::header::{HeaderName, HeaderValue};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream as TkTcpStream};
@@ -358,6 +361,26 @@ mod response_body_lengths {
         assert_eq!(res.headers().get("content-length").unwrap(), "10");
         assert_eq!(res.body().size_hint().exact(), Some(10));
     }
+
+    #[tokio::test]
+    async fn http2_implicit_empty_size_hint() {
+        use http_body::Body;
+
+        let server = serve();
+        let addr_str = format!("http://{}", server.addr());
+        server.reply();
+
+        let client = Client::builder()
+            .http2_only(true)
+            .build_http::<hyper::Body>();
+        let uri = addr_str
+            .parse::<hyper::Uri>()
+            .expect("server addr should parse");
+
+        let res = client.get(uri).await.unwrap();
+        assert_eq!(res.headers().get("content-length"), None);
+        assert_eq!(res.body().size_hint().exact(), Some(0));
+    }
 }
 
 #[test]
@@ -403,6 +426,44 @@ fn get_chunked_response_with_ka() {
 }
 
 #[test]
+fn post_with_content_length_body() {
+    let server = serve();
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        POST / HTTP/1.1\r\n\
+        Content-Length: 5\r\n\
+        \r\n\
+        hello\
+    ",
+    )
+    .unwrap();
+    req.read(&mut [0; 256]).unwrap();
+
+    assert_eq!(server.body(), b"hello");
+}
+
+#[test]
+fn post_with_invalid_prefix_content_length() {
+    let server = serve();
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        POST / HTTP/1.1\r\n\
+        Content-Length: +5\r\n\
+        \r\n\
+        hello\
+    ",
+    )
+    .unwrap();
+
+    let mut buf = [0; 256];
+    let _n = req.read(&mut buf).unwrap();
+    let expected = "HTTP/1.1 400 Bad Request\r\n";
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
 fn post_with_chunked_body() {
     let server = serve();
     let mut req = connect(server.addr());
@@ -426,6 +487,35 @@ fn post_with_chunked_body() {
     req.read(&mut [0; 256]).unwrap();
 
     assert_eq!(server.body(), b"qwert");
+}
+
+#[test]
+fn post_with_chunked_overflow() {
+    let server = serve();
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        POST / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Transfer-Encoding: chunked\r\n\
+        \r\n\
+        f0000000000000003\r\n\
+        abc\r\n\
+        0\r\n\
+        \r\n\
+        GET /sneaky HTTP/1.1\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+    req.read(&mut [0; 256]).unwrap();
+
+    let err = server.body_err().to_string();
+    assert!(
+        err.contains("overflow"),
+        "error should be overflow: {:?}",
+        err
+    );
 }
 
 #[test]
@@ -762,6 +852,39 @@ fn expect_continue_sends_100() {
 }
 
 #[test]
+fn expect_continue_accepts_upper_cased_expectation() {
+    let server = serve();
+    let mut req = connect(server.addr());
+    server.reply();
+
+    req.write_all(
+        b"\
+        POST /foo HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Expect: 100-Continue\r\n\
+        Content-Length: 5\r\n\
+        Connection: Close\r\n\
+        \r\n\
+    ",
+    )
+    .expect("write 1");
+
+    let msg = b"HTTP/1.1 100 Continue\r\n\r\n";
+    let mut buf = vec![0; msg.len()];
+    req.read_exact(&mut buf).expect("read 1");
+    assert_eq!(buf, msg);
+
+    let msg = b"hello";
+    req.write_all(msg).expect("write 2");
+
+    let mut body = String::new();
+    req.read_to_string(&mut body).expect("read 2");
+
+    let body = server.body();
+    assert_eq!(body, msg);
+}
+
+#[test]
 fn expect_continue_but_no_body_is_ignored() {
     let server = serve();
     let mut req = connect(server.addr());
@@ -949,6 +1072,23 @@ fn http_10_request_receives_http_10_response() {
     .unwrap();
 
     let expected = "HTTP/1.0 200 OK\r\ncontent-length: 0\r\n";
+    let mut buf = [0; 256];
+    let n = req.read(&mut buf).unwrap();
+    assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
+fn http_11_uri_too_long() {
+    let server = serve();
+
+    let long_path = "a".repeat(65534);
+    let request_line = format!("GET /{} HTTP/1.1\r\n\r\n", long_path);
+
+    let mut req = connect(server.addr());
+    req.write_all(request_line.as_bytes()).unwrap();
+
+    let expected = "HTTP/1.1 414 URI Too Long\r\ncontent-length: 0\r\n";
     let mut buf = [0; 256];
     let n = req.read(&mut buf).unwrap();
     assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
@@ -1189,6 +1329,127 @@ fn header_name_too_long() {
     let mut buf = [0; 1024];
     let n = req.read(&mut buf).unwrap();
     assert!(s(&buf[..n]).starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+#[tokio::test]
+async fn header_read_timeout_slow_writes() {
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 1");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 2");
+        thread::sleep(Duration::from_secs(6));
+        tcp.write_all(
+            b"\
+            Works: 0\r\n\
+        ",
+        )
+        .expect_err("write 3");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let conn = Http::new()
+        .http1_header_read_timeout(Duration::from_secs(5))
+        .serve_connection(
+            socket,
+            service_fn(|_| {
+                let res = Response::builder()
+                    .status(200)
+                    .body(hyper::Body::empty())
+                    .unwrap();
+                future::ready(Ok::<_, hyper::Error>(res))
+            }),
+        );
+    conn.without_shutdown().await.expect_err("header timeout");
+}
+
+#[tokio::test]
+async fn header_read_timeout_slow_writes_multiple_requests() {
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 1");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 2");
+
+        thread::sleep(Duration::from_secs(3));
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 3");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 4");
+
+        thread::sleep(Duration::from_secs(6));
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 5");
+        thread::sleep(Duration::from_secs(6));
+        tcp.write_all(
+            b"\
+            Works: 0\r\n\
+        ",
+        )
+        .expect_err("write 6");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let conn = Http::new()
+        .http1_header_read_timeout(Duration::from_secs(5))
+        .serve_connection(
+            socket,
+            service_fn(|_| {
+                let res = Response::builder()
+                    .status(200)
+                    .body(hyper::Body::empty())
+                    .unwrap();
+                future::ready(Ok::<_, hyper::Error>(res))
+            }),
+        );
+    conn.without_shutdown().await.expect_err("header timeout");
 }
 
 #[tokio::test]
@@ -1480,6 +1741,339 @@ async fn http_connect_new() {
     let mut vec = vec![];
     io.read_to_end(&mut vec).await.unwrap();
     assert_eq!(s(&vec), "bar=foo");
+}
+
+#[tokio::test]
+async fn h2_connect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = pretty_env_logger::try_init();
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn = connect_async(addr).await;
+
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    async fn connect_and_recv_bread(
+        h2: &mut SendRequest<Bytes>,
+    ) -> (RecvStream, SendStream<Bytes>) {
+        let request = Request::connect("localhost").body(()).unwrap();
+        let (response, send_stream) = h2.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let bytes = body.data().await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"Bread?");
+        let _ = body.flow_control().release_capacity(bytes.len());
+
+        (body, send_stream)
+    }
+
+    tokio::spawn(async move {
+        let (mut recv_stream, mut send_stream) = connect_and_recv_bread(&mut h2).await;
+
+        send_stream.send_data("Baguette!".into(), true).unwrap();
+
+        assert!(recv_stream.data().await.unwrap().unwrap().is_empty());
+    });
+
+    let svc = service_fn(move |req: Request<Body>| {
+        let on_upgrade = hyper::upgrade::on(req);
+
+        tokio::spawn(async move {
+            let mut upgraded = on_upgrade.await.expect("on_upgrade");
+            upgraded.write_all(b"Bread?").await.unwrap();
+
+            let mut vec = vec![];
+            upgraded.read_to_end(&mut vec).await.unwrap();
+            assert_eq!(s(&vec), "Baguette!");
+
+            upgraded.shutdown().await.unwrap();
+        });
+
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    Http::new()
+        .http2_only(true)
+        .serve_connection(socket, svc)
+        .with_upgrades()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn h2_connect_multiplex() {
+    use futures_util::stream::FuturesUnordered;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = pretty_env_logger::try_init();
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn = connect_async(addr).await;
+
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    tokio::spawn(async move {
+        let mut streams = vec![];
+        for i in 0..80 {
+            let request = Request::connect(format!("localhost_{}", i % 4))
+                .body(())
+                .unwrap();
+            let (response, send_stream) = h2.send_request(request, false).unwrap();
+            streams.push((i, response, send_stream));
+        }
+
+        let futures = streams
+            .into_iter()
+            .map(|(i, response, mut send_stream)| async move {
+                if i % 4 == 0 {
+                    return;
+                }
+
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+
+                if i % 4 == 1 {
+                    return;
+                }
+
+                let mut body = response.into_body();
+                let bytes = body.data().await.unwrap().unwrap();
+                assert_eq!(&bytes[..], b"Bread?");
+                let _ = body.flow_control().release_capacity(bytes.len());
+
+                if i % 4 == 2 {
+                    return;
+                }
+
+                send_stream.send_data("Baguette!".into(), true).unwrap();
+
+                assert!(body.data().await.unwrap().unwrap().is_empty());
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        futures.for_each(future::ready).await;
+    });
+
+    let svc = service_fn(move |req: Request<Body>| {
+        let authority = req.uri().authority().unwrap().to_string();
+        let on_upgrade = hyper::upgrade::on(req);
+
+        tokio::spawn(async move {
+            let upgrade_res = on_upgrade.await;
+            if authority == "localhost_0" {
+                assert!(upgrade_res.expect_err("upgrade cancelled").is_canceled());
+                return;
+            }
+            let mut upgraded = upgrade_res.expect("upgrade successful");
+
+            upgraded.write_all(b"Bread?").await.unwrap();
+
+            let mut vec = vec![];
+            let read_res = upgraded.read_to_end(&mut vec).await;
+
+            if authority == "localhost_1" || authority == "localhost_2" {
+                let err = read_res.expect_err("read failed");
+                assert_eq!(err.kind(), io::ErrorKind::Other);
+                assert_eq!(
+                    err.get_ref()
+                        .unwrap()
+                        .downcast_ref::<h2::Error>()
+                        .unwrap()
+                        .reason(),
+                    Some(h2::Reason::CANCEL),
+                );
+                return;
+            }
+
+            read_res.unwrap();
+            assert_eq!(s(&vec), "Baguette!");
+
+            upgraded.shutdown().await.unwrap();
+        });
+
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    Http::new()
+        .http2_only(true)
+        .serve_connection(socket, svc)
+        .with_upgrades()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn h2_connect_large_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = pretty_env_logger::try_init();
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn = connect_async(addr).await;
+
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    const NO_BREAD: &str = "All work and no bread makes nox a dull boy.\n";
+
+    async fn connect_and_recv_bread(
+        h2: &mut SendRequest<Bytes>,
+    ) -> (RecvStream, SendStream<Bytes>) {
+        let request = Request::connect("localhost").body(()).unwrap();
+        let (response, send_stream) = h2.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let bytes = body.data().await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"Bread?");
+        let _ = body.flow_control().release_capacity(bytes.len());
+
+        (body, send_stream)
+    }
+
+    tokio::spawn(async move {
+        let (mut recv_stream, mut send_stream) = connect_and_recv_bread(&mut h2).await;
+
+        let large_body = Bytes::from(NO_BREAD.repeat(9000));
+
+        send_stream.send_data(large_body.clone(), false).unwrap();
+        send_stream.send_data(large_body, true).unwrap();
+
+        assert!(recv_stream.data().await.unwrap().unwrap().is_empty());
+    });
+
+    let svc = service_fn(move |req: Request<Body>| {
+        let on_upgrade = hyper::upgrade::on(req);
+
+        tokio::spawn(async move {
+            let mut upgraded = on_upgrade.await.expect("on_upgrade");
+            upgraded.write_all(b"Bread?").await.unwrap();
+
+            let mut vec = vec![];
+            if upgraded.read_to_end(&mut vec).await.is_err() {
+                return;
+            }
+            assert_eq!(vec.len(), NO_BREAD.len() * 9000 * 2);
+
+            upgraded.shutdown().await.unwrap();
+        });
+
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    Http::new()
+        .http2_only(true)
+        .serve_connection(socket, svc)
+        .with_upgrades()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn h2_connect_empty_frames() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = pretty_env_logger::try_init();
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn = connect_async(addr).await;
+
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    async fn connect_and_recv_bread(
+        h2: &mut SendRequest<Bytes>,
+    ) -> (RecvStream, SendStream<Bytes>) {
+        let request = Request::connect("localhost").body(()).unwrap();
+        let (response, send_stream) = h2.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let bytes = body.data().await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"Bread?");
+        let _ = body.flow_control().release_capacity(bytes.len());
+
+        (body, send_stream)
+    }
+
+    tokio::spawn(async move {
+        let (mut recv_stream, mut send_stream) = connect_and_recv_bread(&mut h2).await;
+
+        send_stream.send_data("".into(), false).unwrap();
+        send_stream.send_data("".into(), false).unwrap();
+        send_stream.send_data("".into(), false).unwrap();
+        send_stream.send_data("Baguette!".into(), false).unwrap();
+        send_stream.send_data("".into(), true).unwrap();
+
+        assert!(recv_stream.data().await.unwrap().unwrap().is_empty());
+    });
+
+    let svc = service_fn(move |req: Request<Body>| {
+        let on_upgrade = hyper::upgrade::on(req);
+
+        tokio::spawn(async move {
+            let mut upgraded = on_upgrade.await.expect("on_upgrade");
+            upgraded.write_all(b"Bread?").await.unwrap();
+
+            let mut vec = vec![];
+            upgraded.read_to_end(&mut vec).await.unwrap();
+            assert_eq!(s(&vec), "Baguette!");
+
+            upgraded.shutdown().await.unwrap();
+        });
+
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    Http::new()
+        .http2_only(true)
+        .serve_connection(socket, svc)
+        .with_upgrades()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

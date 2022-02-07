@@ -2,9 +2,49 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use tokio::sync::oneshot;
 
+use hyper::body::{Bytes, HttpBody};
+use hyper::header::{HeaderMap, HeaderValue};
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Error, Response, Server};
+use hyper::{Error, Response, Server};
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+struct Body {
+    // Our Body type is !Send and !Sync:
+    _marker: PhantomData<*const ()>,
+    data: Option<Bytes>,
+}
+
+impl From<String> for Body {
+    fn from(a: String) -> Self {
+        Body {
+            _marker: PhantomData,
+            data: Some(a.into()),
+        }
+    }
+}
+
+impl HttpBody for Body {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_data(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        Poll::Ready(self.get_mut().data.take().map(Ok))
+    }
+
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap<HeaderValue>>, Self::Error>> {
+        Poll::Ready(Ok(None))
+    }
+}
 
 fn main() {
     pretty_env_logger::init();
@@ -41,6 +81,13 @@ async fn run() {
     });
 
     let server = Server::bind(&addr).executor(LocalExec).serve(make_service);
+
+    // Just shows that with_graceful_shutdown compiles with !Send,
+    // !Sync HttpBody.
+    let (_tx, rx) = oneshot::channel::<()>();
+    let server = server.with_graceful_shutdown(async move {
+        rx.await.ok();
+    });
 
     println!("Listening on http://{}", addr);
 

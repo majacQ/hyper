@@ -1,33 +1,37 @@
 use std::error::Error as StdError;
 
-use pin_project::pin_project;
+use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::debug;
 
-use super::conn::{SpawnAll, UpgradeableConnection, Watcher};
 use super::accept::Accept;
+use super::conn::{SpawnAll, UpgradeableConnection, Watcher};
 use crate::body::{Body, HttpBody};
 use crate::common::drain::{self, Draining, Signal, Watch, Watching};
 use crate::common::exec::{ConnStreamExec, NewSvcExec};
 use crate::common::{task, Future, Pin, Poll, Unpin};
 use crate::service::{HttpService, MakeServiceRef};
 
-#[allow(missing_debug_implementations)]
-#[pin_project]
-pub struct Graceful<I, S, F, E> {
-    #[pin]
-    state: State<I, S, F, E>,
+pin_project! {
+    #[allow(missing_debug_implementations)]
+    pub struct Graceful<I, S, F, E> {
+        #[pin]
+        state: State<I, S, F, E>,
+    }
 }
 
-#[pin_project(project = StateProj)]
-pub(super) enum State<I, S, F, E> {
-    Running {
-        drain: Option<(Signal, Watch)>,
-        #[pin]
-        spawn_all: SpawnAll<I, S, E>,
-        #[pin]
-        signal: F,
-    },
-    Draining(Draining),
+pin_project! {
+    #[project = StateProj]
+    pub(super) enum State<I, S, F, E> {
+        Running {
+            drain: Option<(Signal, Watch)>,
+            #[pin]
+            spawn_all: SpawnAll<I, S, E>,
+            #[pin]
+            signal: F,
+        },
+        Draining { draining: Draining },
+    }
 }
 
 impl<I, S, F, E> Graceful<I, S, F, E> {
@@ -50,7 +54,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: MakeServiceRef<IO, Body, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    B: HttpBody + Send + Sync + 'static,
+    B: HttpBody + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     F: Future<Output = ()>,
     E: ConnStreamExec<<S::Service as HttpService<Body>>::Future, B>,
@@ -71,14 +75,16 @@ where
                         Poll::Ready(()) => {
                             debug!("signal received, starting graceful shutdown");
                             let sig = drain.take().expect("drain channel").0;
-                            State::Draining(sig.drain())
+                            State::Draining {
+                                draining: sig.drain(),
+                            }
                         }
                         Poll::Pending => {
                             let watch = drain.as_ref().expect("drain channel").1.clone();
                             return spawn_all.poll_watch(cx, &GracefulWatcher(watch));
                         }
                     },
-                    StateProj::Draining(ref mut draining) => {
+                    StateProj::Draining { ref mut draining } => {
                         return Pin::new(draining).poll(cx).map(Ok);
                     }
                 }
@@ -97,7 +103,7 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: HttpService<Body>,
     E: ConnStreamExec<S::Future, S::ResBody>,
-    S::ResBody: Send + Sync + 'static,
+    S::ResBody: 'static,
     <S::ResBody as HttpBody>::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
     type Future =
@@ -113,7 +119,7 @@ where
     S: HttpService<Body>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     I: AsyncRead + AsyncWrite + Unpin,
-    S::ResBody: HttpBody + Send + 'static,
+    S::ResBody: HttpBody + 'static,
     <S::ResBody as HttpBody>::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: ConnStreamExec<S::Future, S::ResBody>,
 {

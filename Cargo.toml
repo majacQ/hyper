@@ -1,6 +1,6 @@
 [package]
 name = "hyper"
-version = "0.14.7" # don't forget to update html_root_url
+version = "0.14.16"
 description = "A fast and correct HTTP library."
 readme = "README.md"
 homepage = "https://hyper.rs"
@@ -30,11 +30,11 @@ futures-util = { version = "0.3", default-features = false }
 http = "0.2"
 http-body = "0.4"
 httpdate = "1.0"
-httparse = "1.4"
-h2 = { version = "0.3", optional = true }
-itoa = "0.4.1"
+httparse = "1.5.1"
+h2 = { version = "0.3.9", optional = true }
+itoa = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-pin-project = "1.0"
+pin-project-lite = "0.2.4"
 tower-service = "0.3"
 tokio = { version = "1", features = ["sync"] }
 want = "0.3"
@@ -50,8 +50,7 @@ matches = "0.1"
 num_cpus = "1.0"
 pretty_env_logger = "0.4"
 spmc = "0.3"
-serde = "1.0"
-serde_derive = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [
     "fs",
@@ -66,8 +65,7 @@ tokio = { version = "1", features = [
 ] }
 tokio-test = "0.4"
 tokio-util = { version = "0.6", features = ["codec"] }
-tower = { version = "0.4", features = ["make"] }
-tower-util = "0.3"
+tower = { version = "0.4", features = ["make", "util"] }
 url = "2.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
@@ -102,6 +100,7 @@ stream = []
 runtime = [
     "tcp",
     "tokio/rt",
+    "tokio/time",
 ]
 tcp = [
     "socket2",
@@ -254,3 +253,6 @@ required-features = ["full"]
 name = "server"
 path = "tests/server.rs"
 required-features = ["full"]
+
+[patch.crates-io]
+httparse = { git = "https://github.com/nox/httparse.git", branch = "line-folding" }

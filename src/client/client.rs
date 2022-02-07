@@ -8,17 +8,23 @@ use futures_util::future::{self, Either, FutureExt as _, TryFutureExt as _};
 use http::header::{HeaderValue, HOST};
 use http::uri::{Port, Scheme};
 use http::{Method, Request, Response, Uri, Version};
+use tracing::{debug, trace, warn};
 
 use super::conn;
 use super::connect::{self, sealed::Connect, Alpn, Connected, Connection};
-use super::pool::{self, Key as PoolKey, Pool, Poolable, Pooled, Reservation};
+use super::pool::{
+    self, CheckoutIsClosedError, Key as PoolKey, Pool, Poolable, Pooled, Reservation,
+};
 #[cfg(feature = "tcp")]
 use super::HttpConnector;
 use crate::body::{Body, HttpBody};
-use crate::common::{exec::BoxSendFuture, lazy as hyper_lazy, task, Future, Lazy, Pin, Poll};
+use crate::common::{exec::BoxSendFuture, sync_wrapper::SyncWrapper, lazy as hyper_lazy, task, Future, Lazy, Pin, Poll};
 use crate::rt::Executor;
 
 /// A Client to make outgoing HTTP requests.
+///
+/// `Client` is cheap to clone and cloning is the recommended way to share a `Client`. The
+/// underlying connection pool will be reused.
 #[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 pub struct Client<C, B = Body> {
     config: Config,
@@ -39,7 +45,7 @@ struct Config {
 /// This is returned by `Client::request` (and `Client::get`).
 #[must_use = "futures do nothing unless polled"]
 pub struct ResponseFuture {
-    inner: Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>,
+    inner: SyncWrapper<Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>>,
 }
 
 // ===== impl Client =====
@@ -162,16 +168,12 @@ where
             Version::HTTP_10 => {
                 if is_http_connect {
                     warn!("CONNECT is not allowed for HTTP/1.0");
-                    return ResponseFuture::new(Box::pin(future::err(
+                    return ResponseFuture::new(future::err(
                         crate::Error::new_user_unsupported_request_method(),
-                    )));
+                    ));
                 }
             }
-            other_h2 @ Version::HTTP_2 => {
-                if self.config.ver != Ver::Http2 {
-                    return ResponseFuture::error_version(other_h2);
-                }
-            }
+            Version::HTTP_2 => (),
             // completely unsupported HTTP version (like HTTP/0.9)!
             other => return ResponseFuture::error_version(other),
         };
@@ -179,11 +181,11 @@ where
         let pool_key = match extract_domain(req.uri_mut(), is_http_connect) {
             Ok(s) => s,
             Err(err) => {
-                return ResponseFuture::new(Box::pin(future::err(err)));
+                return ResponseFuture::new(future::err(err));
             }
         };
 
-        ResponseFuture::new(Box::pin(self.clone().retryably_send_request(req, pool_key)))
+        ResponseFuture::new(self.clone().retryably_send_request(req, pool_key))
     }
 
     async fn retryably_send_request(
@@ -224,9 +226,26 @@ where
         mut req: Request<B>,
         pool_key: PoolKey,
     ) -> Result<Response<Body>, ClientError<B>> {
-        let mut pooled = self.connection_for(pool_key).await?;
+        let mut pooled = match self.connection_for(pool_key).await {
+            Ok(pooled) => pooled,
+            Err(ClientConnectError::Normal(err)) => return Err(ClientError::Normal(err)),
+            Err(ClientConnectError::H2CheckoutIsClosed(reason)) => {
+                return Err(ClientError::Canceled {
+                    connection_reused: true,
+                    req,
+                    reason,
+                })
+            }
+        };
 
         if pooled.is_http1() {
+            if req.version() == Version::HTTP_2 {
+                warn!("Connection is HTTP/1, but request requires HTTP/2");
+                return Err(ClientError::Normal(
+                    crate::Error::new_user_unsupported_version(),
+                ));
+            }
+
             if self.config.set_host {
                 let uri = req.uri().clone();
                 req.headers_mut().entry(HOST).or_insert_with(|| {
@@ -248,12 +267,9 @@ where
                 absolute_form(req.uri_mut());
             } else {
                 origin_form(req.uri_mut());
-            };
+            }
         } else if req.method() == Method::CONNECT {
-            debug!("client does not support CONNECT requests over HTTP2");
-            return Err(ClientError::Normal(
-                crate::Error::new_user_unsupported_request_method(),
-            ));
+            authority_form(req.uri_mut());
         }
 
         let fut = pooled
@@ -318,7 +334,7 @@ where
     async fn connection_for(
         &self,
         pool_key: PoolKey,
-    ) -> Result<Pooled<PoolClient<B>>, ClientError<B>> {
+    ) -> Result<Pooled<PoolClient<B>>, ClientConnectError> {
         // This actually races 2 different futures to try to get a ready
         // connection the fastest, and to reduce connection churn.
         //
@@ -334,6 +350,7 @@ where
         //   and then be inserted into the pool as an idle connection.
         let checkout = self.pool.checkout(pool_key.clone());
         let connect = self.connect_to(pool_key);
+        let is_ver_h2 = self.config.ver == Ver::Http2;
 
         // The order of the `select` is depended on below...
 
@@ -377,16 +394,25 @@ where
             // In both cases, we should just wait for the other future.
             Either::Left((Err(err), connecting)) => {
                 if err.is_canceled() {
-                    connecting.await.map_err(ClientError::Normal)
+                    connecting.await.map_err(ClientConnectError::Normal)
                 } else {
-                    Err(ClientError::Normal(err))
+                    Err(ClientConnectError::Normal(err))
                 }
             }
             Either::Right((Err(err), checkout)) => {
                 if err.is_canceled() {
-                    checkout.await.map_err(ClientError::Normal)
+                    checkout.await.map_err(move |err| {
+                        if is_ver_h2
+                            && err.is_canceled()
+                            && err.find_source::<CheckoutIsClosedError>().is_some()
+                        {
+                            ClientConnectError::H2CheckoutIsClosed(err)
+                        } else {
+                            ClientConnectError::Normal(err)
+                        }
+                    })
                 } else {
-                    Err(ClientError::Normal(err))
+                    Err(ClientConnectError::Normal(err))
                 }
             }
         }
@@ -554,8 +580,13 @@ impl<C, B> fmt::Debug for Client<C, B> {
 // ===== impl ResponseFuture =====
 
 impl ResponseFuture {
-    fn new(fut: Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>) -> Self {
-        Self { inner: fut }
+    fn new<F>(value: F) -> Self
+    where
+        F: Future<Output = crate::Result<Response<Body>>> + Send + 'static,
+    {
+        Self {
+            inner: SyncWrapper::new(Box::pin(value))
+        }
     }
 
     fn error_version(ver: Version) -> Self {
@@ -576,7 +607,7 @@ impl Future for ResponseFuture {
     type Output = crate::Result<Response<Body>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        self.inner.get_mut().as_mut().poll(cx)
     }
 }
 
@@ -717,6 +748,11 @@ impl<B> ClientError<B> {
             }
         }
     }
+}
+
+enum ClientConnectError {
+    Normal(crate::Error),
+    H2CheckoutIsClosed(crate::Error),
 }
 
 /// A marker to identify what version a pooled connection is.
@@ -941,7 +977,7 @@ impl Builder {
     ///
     /// Default is an adaptive read buffer.
     pub fn http1_read_buf_exact_size(&mut self, sz: usize) -> &mut Self {
-        self.conn_builder.h1_read_buf_exact_size(Some(sz));
+        self.conn_builder.http1_read_buf_exact_size(Some(sz));
         self
     }
 
@@ -957,12 +993,15 @@ impl Builder {
     #[cfg(feature = "http1")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
     pub fn http1_max_buf_size(&mut self, max: usize) -> &mut Self {
-        self.conn_builder.h1_max_buf_size(max);
+        self.conn_builder.http1_max_buf_size(max);
         self
     }
 
     /// Set whether HTTP/1 connections will accept spaces between header names
     /// and the colon that follow them in responses.
+    ///
+    /// Newline codepoints (`\r` and `\n`) will be transformed to spaces when
+    /// parsing.
     ///
     /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
     /// to say about it:
@@ -982,7 +1021,61 @@ impl Builder {
     /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
     pub fn http1_allow_spaces_after_header_name_in_responses(&mut self, val: bool) -> &mut Self {
         self.conn_builder
-            .h1_allow_spaces_after_header_name_in_responses(val);
+            .http1_allow_spaces_after_header_name_in_responses(val);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will accept obsolete line folding for
+    /// header values.
+    ///
+    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+    /// to say about it:
+    ///
+    /// > A server that receives an obs-fold in a request message that is not
+    /// > within a message/http container MUST either reject the message by
+    /// > sending a 400 (Bad Request), preferably with a representation
+    /// > explaining that obsolete line folding is unacceptable, or replace
+    /// > each received obs-fold with one or more SP octets prior to
+    /// > interpreting the field value or forwarding the message downstream.
+    ///
+    /// > A proxy or gateway that receives an obs-fold in a response message
+    /// > that is not within a message/http container MUST either discard the
+    /// > message and replace it with a 502 (Bad Gateway) response, preferably
+    /// > with a representation explaining that unacceptable line folding was
+    /// > received, or replace each received obs-fold with one or more SP
+    /// > octets prior to interpreting the field value or forwarding the
+    /// > message downstream.
+    ///
+    /// > A user agent that receives an obs-fold in a response message that is
+    /// > not within a message/http container MUST replace each received
+    /// > obs-fold with one or more SP octets prior to interpreting the field
+    /// > value.
+    ///
+    /// Note that this setting does not affect HTTP/2.
+    ///
+    /// Default is false.
+    ///
+    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+    pub fn http1_allow_obsolete_multiline_headers_in_responses(&mut self, val: bool) -> &mut Self {
+        self.conn_builder
+            .http1_allow_obsolete_multiline_headers_in_responses(val);
+        self
+    }
+
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    pub fn http1_writev(&mut self, enabled: bool) -> &mut Builder {
+        self.conn_builder.http1_writev(enabled);
         self
     }
 
@@ -993,18 +1086,25 @@ impl Builder {
     ///
     /// Default is false.
     pub fn http1_title_case_headers(&mut self, val: bool) -> &mut Self {
-        self.conn_builder.h1_title_case_headers(val);
+        self.conn_builder.http1_title_case_headers(val);
         self
     }
 
-    /// Set whether HTTP/1 connections will write header names as provided
-    /// at the socket level.
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Response`. It will also look for and use
+    /// such an extension in any provided `Request`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
     ///
     /// Note that this setting does not affect HTTP/2.
     ///
     /// Default is false.
     pub fn http1_preserve_header_case(&mut self, val: bool) -> &mut Self {
-        self.conn_builder.h1_preserve_header_case(val);
+        self.conn_builder.http1_preserve_header_case(val);
         self
     }
 
@@ -1012,7 +1112,7 @@ impl Builder {
     ///
     /// Default is false.
     pub fn http09_responses(&mut self, val: bool) -> &mut Self {
-        self.conn_builder.h09_responses(val);
+        self.conn_builder.http09_responses(val);
         self
     }
 
@@ -1148,6 +1248,35 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum number of HTTP2 concurrent locally reset streams.
+    ///
+    /// See the documentation of [`h2::client::Builder::max_concurrent_reset_streams`] for more
+    /// details.
+    ///
+    /// The default value is determined by the `h2` crate.
+    ///
+    /// [`h2::client::Builder::max_concurrent_reset_streams`]: https://docs.rs/h2/client/struct.Builder.html#method.max_concurrent_reset_streams
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_concurrent_reset_streams(&mut self, max: usize) -> &mut Self {
+        self.conn_builder.http2_max_concurrent_reset_streams(max);
+        self
+    }
+
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently 1MB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_send_buf_size(&mut self, max: usize) -> &mut Self {
+        self.conn_builder.http2_max_send_buf_size(max);
+        self
+    }
+
     /// Set whether to retry requests that get disrupted before ever starting
     /// to write.
     ///
@@ -1229,6 +1358,12 @@ impl fmt::Debug for Builder {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn response_future_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<ResponseFuture>();
+    }
 
     #[test]
     fn set_relative_uri_with_implicit_path() {
