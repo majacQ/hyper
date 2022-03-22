@@ -1,3 +1,31 @@
+### v0.14.18 (2022-03-22)
+
+
+#### Bug Fixes
+
+* **ffi:** don't build C libraries by default ([1c663706](https://github.com/hyperium/hyper/commit/1c6637060e36654ddb2fdfccb0d146c7ad527476))
+
+
+#### Features
+
+* **client:** add `HttpInfo::local_addr()` method ([055b4e7e](https://github.com/hyperium/hyper/commit/055b4e7ea6bd22859c20d60776b0c8f20d27498e), closes [#2767](https://github.com/hyperium/hyper/issues/2767))
+
+
+### v0.14.17 (2022-02-10)
+
+
+#### Bug Fixes
+
+* **client:** avoid panics in uses of `Instant` (#2746) ([dcdd6d10](https://github.com/hyperium/hyper/commit/dcdd6d109069949ee68ba70ece4a2b4f21079479))
+
+
+#### Features
+
+* **client:** implement the HTTP/2 extended CONNECT protocol from RFC 8441 (#2682) ([5ec094ca](https://github.com/hyperium/hyper/commit/5ec094caa5c999e6f919a2bc82f5f3b7d40c2d8a))
+* **error:** add `Error::message` (#2737) ([6932896a](https://github.com/hyperium/hyper/commit/6932896a7fca58fe461269461f925da8fd4e8d8a), closes [#2732](https://github.com/hyperium/hyper/issues/2732))
+* **http1:** implement obsolete line folding (#2734) ([1f0c177b](https://github.com/hyperium/hyper/commit/1f0c177b35b14054eb1e5108e75f8bd3ff52813e))
+
+
 ### v0.14.16 (2021-12-09)
 
 
